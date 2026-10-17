@@ -35,8 +35,11 @@ with sync_playwright() as p:
     page.wait_for_timeout(300)
     page.click('.nav-item[data-path="qr"]')
     page.click('button[data-act="qr-tab"][data-v="txn"]')
+    # 口令无默认值，须显式输入 ≥8 位
+    page.fill('#qrPwd', 'Test-12345')
+    page.wait_for_timeout(100)
     page.click('button[data-act="qr-gen"]')
-    page.wait_for_timeout(600)
+    page.wait_for_timeout(800)
     payload = page.locator('#qrPayloadBox').text_content().replace('复制', '')
     # 页面内直接 canvas 导出（与 downloadPNG 同路径，16px/模块），同时返回用于比对的同源 SVG 字符串
     dataurl = page.evaluate("""() => {
@@ -65,18 +68,19 @@ open('/tmp/final_qr.png', 'wb').write(png_bytes)
 svg_str = dataurl['svg']
 
 # ---------- 1. 像素级保真：SVG vs PNG ----------
+img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+W = img.shape[1]
+# 16px/模块、静默区 4 模块：PNG 宽 = (n+8)*16 → 矩阵边长 n 动态推导（P2 载荷更长，版本更大）
+n = W // 16 - 8
 rects = re.findall(r'<rect x="(\d+)" y="(\d+)" width="16" height="16"/>', svg_str)
-n = 105
 svg_mat = [[0] * n for _ in range(n)]
 for x, y in rects:
     svg_mat[int(y) // 16 - 4][int(x) // 16 - 4] = 1
 
-img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-W = img.shape[1]
 scale = W // (n + 8)
 png_mat = [[1 if img[(y + 4) * scale + scale // 2, (x + 4) * scale + scale // 2] < 128 else 0 for x in range(n)] for y in range(n)]
 diff = sum(1 for y in range(n) for x in range(n) if svg_mat[y][x] != png_mat[y][x])
-check('PNG 与页面 SVG 像素级一致', diff == 0, f'{diff}/{n * n} 模块差异, {W}px, {scale}px/模块')
+check('PNG 与页面 SVG 像素级一致', diff == 0, f'{diff}/{n * n} 模块差异, {W}px, {scale}px/模块, 版本矩阵 {n}×{n}')
 
 # ---------- 2. OpenCV 解码（重试） ----------
 det = cv2.QRCodeDetector()
@@ -102,13 +106,11 @@ else:
 target = decoded if decoded else payload
 open('/tmp/final_payload.txt', 'w').write(target)
 r = subprocess.run(['node', '-e', '''
-require('/root/.codebuddy/artifact/payinvoice/src/qr_tables.js');
-require('/root/.codebuddy/artifact/payinvoice/src/qrcode.js');
-require('/root/.codebuddy/artifact/payinvoice/src/crypto.js');
+require('/workspace/src/crypto.js');
 var fs = require('fs');
 var payload = fs.readFileSync('/tmp/final_payload.txt', 'utf8');
 try {
-  var obj = PayInvoiceCrypto.decryptPayload(payload, 'payinvoice');
+  var obj = PayInvoiceCrypto.decryptPayload(payload, 'Test-12345');
   console.log(JSON.stringify({ok: true, obj: obj}));
 } catch (e) {
   console.log(JSON.stringify({ok: false, err: e.message}));
@@ -119,7 +121,9 @@ obj = out.get('obj', {})
 check('SM4 解密成功', out.get('ok') is True, out.get('err', ''))
 check('解密内容业务字段正确',
       obj.get('type') == 'txn' and obj.get('seller', {}).get('name') == '上海示例信息技术有限公司'
-      and abs(obj.get('total', {}).get('total', 0) - 112360) < 1,
+      and obj.get('total', {}).get('total') == '112360.00'
+      and obj.get('total', {}).get('amount') == '106000.00'
+      and obj.get('total', {}).get('tax') == '6360.00',
       json.dumps({'type': obj.get('type'), 'seller': obj.get('seller', {}).get('name'),
                   'total': obj.get('total', {}).get('total')}, ensure_ascii=False))
 

@@ -227,31 +227,126 @@ function bytesToUtf8(bytes) {
 }
 
 /* ---------- 高层 API：二维码载荷加解密 ---------- */
-/* 载荷格式：P1. + base64( IV(16) || SM4-CBC(JSON) )，密钥 = SHA256(口令) 前 16 字节 */
-function deriveKey(password) { return sha256(utf8Bytes(password)).slice(0, 16); }
+/*
+ * 载荷格式（v2，Encrypt-then-MAC）：
+ *   'P2.' + base64( salt(16) || IV(16) || SM4-CBC(JSON) || HMAC-SHA256(32) )
+ *   dk    = PBKDF2-HMAC-SHA256(口令, salt, PBKDF2_ITER, 32)
+ *   K_enc = dk[0:16]   （SM4 密钥，128 位）
+ *   K_mac = dk[16:32]  （HMAC-SHA256 密钥，128 位）
+ *   MAC   = HMAC-SHA256(K_mac, IV‖CT)
+ * v1 旧格式（P1. + base64(IV‖CT)，无完整性保护）已停止支持。
+ */
+var PAYLOAD_PREFIX = 'P2.';
+var PBKDF2_ITER = 100000;
+
+/* PBKDF2-HMAC-SHA256（RFC 2898 / RFC 8018） */
+function pbkdf2Sha256(passwordBytes, saltBytes, iterations, dkLen) {
+  if (!isFinite(iterations) || iterations < 1) throw new Error('PBKDF2 迭代次数无效');
+  if (!isFinite(dkLen) || dkLen < 1) throw new Error('PBKDF2 派生长度无效');
+  var out = [], block;
+  var blocks = Math.ceil(dkLen / 32);
+  for (block = 1; block <= blocks; block++) {
+    var salt = saltBytes.slice();
+    salt.push((block >>> 24) & 0xFF, (block >>> 16) & 0xFF, (block >>> 8) & 0xFF, block & 0xFF);
+    var u = hmacSha256(passwordBytes, salt);
+    var t = u.slice();
+    for (var i = 1; i < iterations; i++) {
+      u = hmacSha256(passwordBytes, u);
+      for (var j = 0; j < 32; j++) t[j] = (t[j] ^ u[j]) & 0xFF;
+    }
+    out = out.concat(t);
+  }
+  return out.slice(0, dkLen);
+}
+
+/* 恒定时间比较，防时序侧信道 */
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  var r = 0;
+  for (var i = 0; i < a.length; i++) r |= a[i] ^ b[i];
+  return r === 0;
+}
+
+/* 密钥派生缓存：同一口令重复加解密时避免重复执行 PBKDF2 */
+var keyCache = Object.create(null);
+
+function deriveKeys(password, salt) {
+  var cacheKey = password.length + ':' + password + '|' + salt.join(',');
+  var hit = keyCache[cacheKey];
+  if (hit) return hit;
+  var pwdBytes = utf8Bytes(password);
+  /* 单次 PBKDF2 派生 32 字节后拆分：前 16 字节为 SM4 加密密钥，后 16 字节为 HMAC 密钥 */
+  var dk = pbkdf2Sha256(pwdBytes, salt, PBKDF2_ITER, 32);
+  var keys = { kEnc: dk.slice(0, 16), kMac: dk.slice(16, 32) };
+  /* 缓存上限，防止内存无限增长 */
+  var keys_ = Object.keys(keyCache);
+  if (keys_.length >= 16) delete keyCache[keys_[0]];
+  keyCache[cacheKey] = keys;
+  return keys;
+}
+
+function clearKeyCache() {
+  keyCache = Object.create(null);
+}
+
+/* 安全随机字节：仅接受 crypto.getRandomValues，拒绝弱随机回退 */
+function randomBytes(n) {
+  var c = (typeof global !== 'undefined' && global.crypto) || (typeof window !== 'undefined' && window.crypto);
+  if (!c || typeof c.getRandomValues !== 'function') {
+    throw new Error('当前环境缺少安全随机数源（crypto.getRandomValues），已终止生成。请使用最新版 Chrome/Edge/Firefox 并通过 https 或本地文件打开。');
+  }
+  var arr = new Uint8Array(n);
+  c.getRandomValues(arr);
+  var out = [];
+  for (var i = 0; i < n; i++) out.push(arr[i]);
+  return out;
+}
+
+function isValidBase64(str) {
+  return typeof str === 'string' && str.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(str);
+}
 
 function encryptPayload(obj, password) {
-  var json = JSON.stringify(obj);
-  var plain = utf8Bytes(json);
-  var key = deriveKey(password);
-  var iv = [];
-  var rand = (typeof global.crypto !== 'undefined' && global.crypto.getRandomValues)
-    ? global.crypto.getRandomValues(new Uint8Array(16))
-    : null;
-  if (rand) { for (var i = 0; i < 16; i++) iv.push(rand[i]); }
-  else { for (var j = 0; j < 16; j++) iv.push(Math.floor(Math.random() * 256)); }
-  var ct = sm4EncryptCBC(plain, key, iv);
-  return 'P1.' + bytesToBase64(iv.concat(ct));
+  if (typeof password !== 'string' || password.length < 8) {
+    throw new Error('加密口令至少 8 位（请使用字母、数字组合）');
+  }
+  var plain = utf8Bytes(JSON.stringify(obj));
+  var salt = randomBytes(16);
+  var iv = randomBytes(16);
+  var keys = deriveKeys(password, salt);
+  var ct = sm4EncryptCBC(plain, keys.kEnc, iv);
+  var mac = hmacSha256(keys.kMac, iv.concat(ct));
+  return PAYLOAD_PREFIX + bytesToBase64(salt.concat(iv).concat(ct).concat(mac));
 }
 
 function decryptPayload(payload, password) {
-  if (typeof payload !== 'string' || payload.indexOf('P1.') !== 0) throw new Error('不是有效的加密载荷');
-  var raw = base64ToBytes(payload.slice(3));
-  if (raw.length < 32 || raw.length % 16 !== 0) throw new Error('载荷长度无效');
-  var iv = raw.slice(0, 16), ct = raw.slice(16);
-  var key = deriveKey(password);
-  var plain = sm4DecryptCBC(ct, key, iv);
-  return JSON.parse(bytesToUtf8(plain));
+  if (typeof payload !== 'string' || payload.indexOf('P1.') === 0) {
+    throw new Error('旧版载荷（P1，无完整性保护）已停止支持，请重新生成');
+  }
+  if (typeof payload !== 'string' || payload.indexOf(PAYLOAD_PREFIX) !== 0) {
+    throw new Error('不是有效的加密载荷');
+  }
+  if (typeof password !== 'string' || password.length === 0) {
+    throw new Error('请输入加密口令');
+  }
+  var b64 = payload.slice(PAYLOAD_PREFIX.length);
+  if (!isValidBase64(b64)) throw new Error('载荷不是有效的 Base64 数据');
+  var raw = base64ToBytes(b64);
+  /* salt(16) + IV(16) + MAC(32) + 密文(≥16) */
+  if (raw.length < 80 || raw.length % 16 !== 0) throw new Error('载荷长度无效');
+  var salt = raw.slice(0, 16), iv = raw.slice(16, 32);
+  var mac = raw.slice(raw.length - 32), ct = raw.slice(32, raw.length - 32);
+  var keys = deriveKeys(password, salt);
+  var expectMac = hmacSha256(keys.kMac, iv.concat(ct));
+  if (!timingSafeEqual(expectMac, mac)) {
+    throw new Error('完整性校验失败：口令错误或数据已被篡改');
+  }
+  var plain = sm4DecryptCBC(ct, keys.kEnc, iv);
+  try {
+    return JSON.parse(bytesToUtf8(plain));
+  } catch (e) {
+    throw new Error('解密失败：载荷内容不是有效数据');
+  }
 }
 
 global.PayInvoiceCrypto = {
@@ -261,11 +356,16 @@ global.PayInvoiceCrypto = {
   sha256: sha256,
   sha256Hex: function (bytes) { return sha256(bytes).map(function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join(''); },
   hmacSha256: hmacSha256,
+  pbkdf2Sha256: pbkdf2Sha256,
+  timingSafeEqual: timingSafeEqual,
+  randomBytes: randomBytes,
+  clearKeyCache: clearKeyCache,
+  PAYLOAD_PREFIX: PAYLOAD_PREFIX,
+  PBKDF2_ITER: PBKDF2_ITER,
   bytesToBase64: bytesToBase64,
   base64ToBytes: base64ToBytes,
   utf8Bytes: utf8Bytes,
   bytesToUtf8: bytesToUtf8,
-  deriveKey: deriveKey,
   encryptPayload: encryptPayload,
   decryptPayload: decryptPayload
 };

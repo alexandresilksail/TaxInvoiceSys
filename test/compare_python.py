@@ -10,7 +10,7 @@ cases = [
     ('byte', 'PAYINVOICE 开票助手 SM4 TEST'),
 ]
 
-js = json.load(open('/root/.codebuddy/artifact/payinvoice/test/js_matrices.json'))
+js = json.load(open('/workspace/test/js_matrices.json'))
 
 total, match, mismatch, err = 0, 0, 0, 0
 details = []

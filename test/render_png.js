@@ -2,8 +2,8 @@
 const zlib = require('zlib');
 const fs = require('fs');
 
-require('/root/.codebuddy/artifact/payinvoice/src/qr_tables.js');
-require('/root/.codebuddy/artifact/payinvoice/src/qrcode.js');
+require('/workspace/src/qr_tables.js');
+require('/workspace/src/qrcode.js');
 const QR = globalThis.PayInvoiceQR;
 
 function crc32(buf) {
@@ -65,7 +65,7 @@ for (let i = 0; i < texts.length; i++) {
   for (const ec of levels) {
     try {
       const r = QR.encode(texts[i], { ecLevel: ec });
-      const path = `/root/.codebuddy/artifact/payinvoice/test/e2e_${i}_${ec}.png`;
+      const path = `/workspace/test/e2e_${i}_${ec}.png`;
       writePNG(path, r.modules, 4, 4);
       out.push({ file: path, text: texts[i], ec, version: r.version });
     } catch (e) {
@@ -73,5 +73,5 @@ for (let i = 0; i < texts.length; i++) {
     }
   }
 }
-fs.writeFileSync('/root/.codebuddy/artifact/payinvoice/test/e2e_manifest.json', JSON.stringify(out));
+fs.writeFileSync('/workspace/test/e2e_manifest.json', JSON.stringify(out));
 console.log('rendered:', out.filter(o => o.file).length, '/', out.length);

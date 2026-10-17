@@ -5,9 +5,61 @@
 
 ## 交付物
 
-**[payinvoice开票助手.html](payinvoice开票助手.html)**（124 KB）——双击即可在 Chrome / Edge 等现代浏览器运行，零依赖、无需联网、`file://` 协议直接可用。
+**[payinvoice开票助手.html](payinvoice开票助手.html)**（约 143 KB）——双击即可在 Chrome / Edge 等现代浏览器运行，零依赖、无需联网、`file://` 协议直接可用。由 `python3 build.py` 从 `src/` 组装生成。
 
-### 功能模块（对应方案七章）
+---
+
+## 本次更新（v1.1）修复清单
+
+对现有代码进行了全系统安全审计与缺陷修复，**未更换技术栈、未重构有效功能**。全部改动如下：
+
+### 1. 加密模块安全（src/crypto.js）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| C1 | 密钥仅由口令 SHA-256 单次派生，可被暴力破解 | 改为 **PBKDF2-HMAC-SHA256，100000 次迭代**（RFC 2898/8018），与 Node 原生 `crypto.pbkdf2Sync` 交叉验证一致 |
+| C2 | 存在固定默认口令（口令为空也可加密） | **删除默认口令**；口令少于 8 位拒绝加密，解密同样拒绝空口令 |
+| C3 | 密文无完整性校验，篡改后静默解密出垃圾数据 | **Encrypt-then-MAC**：载荷尾部附加 HMAC-SHA256，解密前先做**恒定时间比较**（`timingSafeEqual`），不一致即拒绝 |
+| C4 | 载荷无版本标识，旧格式无法识别 | 统一 **P2 格式**：`'P2.' + Base64(salt(16) ‖ IV(16) ‖ SM4-CBC(JSON) ‖ HMAC(32))`；旧版 P1 载荷明确拒绝并提示 |
+| C5 | 随机数回退到 `Math.random` | **强制安全随机源**：仅接受 `crypto.getRandomValues`，缺失时直接抛错，杜绝弱随机 IV/salt |
+| — | 加解密耗时 1100ms（两次 PBKDF2） | 改为**单次派生 32 字节拆分**（前 16B 作 SM4 密钥、后 16B 作 HMAC 密钥），耗时降至约 530ms |
+
+载荷解析同时加固：严格 Base64 校验、长度必须 ≥80 且为 16 的倍数、`JSON.parse` 异常捕获、逐字段边界检查。
+
+### 2. 金额计算与舍入规则统一（src/money.js 新增 + src/app.js 重构）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| M1 | 浮点运算导致 `0.1+0.2≠0.3` 类误差、大写金额错位 | **全程整数"分"运算**：`parseDecimal` 解析即四舍五入到分，合计无浮点漂移（10 万行验证） |
+| M2 | 数量×单价双重舍入（3×0.335 得 1.02，应为 1.01） | 数量精确到 6 位小数、单价 4 位小数，**乘积累加后单次四舍五入到分** |
+| M3 | 行税额不先舍入再合计，多行累加出现分位误差 | 行税额**先舍入到分**再计入合计 |
+| M4 | 非法输入、科学计数法、负数金额混入计算 | `parseDecimal` 一律返回 null，非法行不计入合计并由自检标记；金额上限 ¥100 亿（分 × 税率 ≤ 1.3e15，在 2^53 精确整数域内） |
+| M5 | 自动计算值与用户手填值无法区分 | 引入 `_amtAuto` / `_taxAuto` 自动带出标记：手填值永久保留，自动值随数量/单价/税率变更实时刷新 |
+| M6 | 票面预览选择器脆弱，DOM 微调即失效 | 改用 `.kv[data-kv]` 属性定位 |
+| M7 | 二维码载荷金额为裸数字，精度依赖对端解析 | 载荷输出规范化**分字符串**，无效行过滤后才进入合计 |
+
+### 3. 数据保护与导入导出（src/app.js）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| D1 | 加密口令写入 localStorage / 导出备份 | 口令**仅存内存**（`qrPassword`），`defaultState().qr` 已移除 password 字段；导出备份结构经 e2e 验证无口令字段 |
+| D2 | 导入备份零校验，脏数据可破坏 state 结构 | 新增 `sanitizeState` **白名单校验**：类型归一化（数字税号→字符串）、字段截断（名称 200 / 备注 500 / 税号 40 等）、明细条数限量 200、打印宽度钳制 1.8~30cm、非法枚举回落默认、剔除口令与未知顶层字段、非对象行剔除、非法时间戳回落 0 |
+| D3 | 导入文件大小不限，可写爆 localStorage | 备份上限 **2MB**，超出拒绝；`reader.onerror` 异常处理 |
+| D4 | 快速连点导出/导入导致重复提交、状态错乱 | `dataBusy = {exporting, importing}` **按操作类型加锁**，800ms 内重复点击直接忽略 |
+| D5 | 口令不足 8 位时静默生成未加密二维码 | 口令输入框 `type="password" autocomplete="off"`；不足 8 位 toast 拒绝并聚焦，二维码区显示警告，PNG/打印按钮需加密成功后才可用 |
+| D6 | 自检覆盖不足 | 新增"明细金额/税额均为有效数字（非负、小数不超限）"检查项，非法输入实时标记 |
+
+### 4. 测试体系扩充（test/）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| T1 | 无单元测试入口 | 新增 `crypto_test.js`（26 项）、`money_test.js`（21 项） |
+| T2 | 测试脚本路径过期、断言与新格式不符 | 修复全部过期路径与 P1/total 数字断言；矩阵规模由硬编码改为按屏幕宽动态推导 |
+| T3 | 无一键入口 | 新增 `test/run_all.sh`，一条命令跑完五个阶段 |
+
+---
+
+## 功能模块（对应方案七章）
 
 | 模块 | 对应章节 | 功能 |
 |---|---|---|
@@ -18,28 +70,32 @@
 | 配套软件管理 | 四、五 | 发票助手 PC 版/安卓版/打印控件安装、卸载、残留清理、冲突处理 |
 | 异常处理 | 六 | 8 类异常现象与解决方案 |
 | 合规与安全 | 七 | 8 条合规提示 + 数据边界说明 |
-| 数据管理 | — | localStorage 导入导出/清空/示例数据 |
+| 数据管理 | — | localStorage 导入导出/清空/示例数据（均经白名单校验） |
 
 ## 仓库结构
 
 ```
-├── payinvoice开票助手.html      # 交付物：单文件离线应用（build.py 产出）
-├── payinvoice开票助手-使用说明.md # 使用说明
-├── build.py                    # 组装脚本：src/* → 单文件 HTML
-├── src/                        # 源码（全部纯 JS，无外部依赖）
-│   ├── qr_tables.js            #   QR 标准表（RS 分块表、校正图形定位表）
-│   ├── qrcode.js               #   QR 编码器（ISO/IEC 18004，v1-40，L/M/Q/H）
-│   ├── sm4_tables.json         #   SM4 标准表（源自 gmssl）
-│   ├── crypto.js               #   国密加密（SM4-CBC + SHA-256/HMAC）
-│   ├── style.css               #   样式
-│   └── app.js                  #   应用主逻辑
-├── test/                       # 验证脚本
-│   ├── e2e.py                  #   Playwright 端到端测试（41 项）
-│   ├── final_e2e.py            #   最终闭环：生成→PNG→解码→解密
-│   ├── compare_python.py       #   与 Python qrcode 库矩阵级比对
-│   ├── gen_js_matrices.js      #   JS 矩阵生成
-│   ├── gen_forced.js           #   强制掩码矩阵生成
-│   └── render_png.js           #   PNG 渲染（Node 手写 PNG writer）
+├── payinvoice开票助手.html          # 交付物：单文件离线应用（build.py 产出）
+├── payinvoice开票助手-使用说明.md     # 使用说明
+├── build.py                        # 组装脚本：src/* → 单文件 HTML
+├── src/                            # 源码（全部纯 JS，无外部依赖）
+│   ├── qr_tables.js                #   QR 标准表（RS 分块表、校正图形定位表）
+│   ├── qrcode.js                   #   QR 编码器（ISO/IEC 18004，v1-40，L/M/Q/H）
+│   ├── sm4_tables.json             #   SM4 标准表（源自 gmssl）
+│   ├── money.js                    #   金额计算与舍入规则（整数分运算）
+│   ├── crypto.js                   #   国密加密（PBKDF2 + SM4-CBC + HMAC-SHA256）
+│   ├── style.css                   #   样式
+│   └── app.js                      #   应用主逻辑
+└── test/                           # 验证脚本
+    ├── run_all.sh                  #   一键运行全部测试
+    ├── crypto_test.js              #   加密模块安全测试（Node，26 项）
+    ├── money_test.js               #   金额计算规则测试（Node，21 项）
+    ├── e2e.py                      #   Playwright 端到端测试（68 项）
+    ├── final_e2e.py                #   最终闭环：生成→PNG→解码→解密（5 项）
+    ├── compare_python.py           #   与 Python qrcode 库矩阵级比对
+    ├── gen_js_matrices.js          #   JS 矩阵生成
+    ├── gen_forced.js               #   强制掩码矩阵生成
+    └── render_png.js               #   PNG 渲染（Node 手写 PNG writer）
 └── docs/
     └── 上海电子税务局发票开具与配套软件管理操作方案.md  # 原始方案文档
 ```
@@ -47,26 +103,63 @@
 ## 构建
 
 ```bash
-python3 build.py   # 输出 payinvoice开票助手.html（当前目录）
+python3 build.py   # 输出 payinvoice开票助手.html（当前目录，约 143 KB）
 ```
 
 ## 测试
 
 ```bash
-python3 test/e2e.py         # 端到端测试（需 playwright）
-python3 test/final_e2e.py   # 二维码最终闭环验证（需 playwright + opencv）
-node test/gen_js_matrices.js && python3 test/compare_python.py  # QR 矩阵级比对
+bash test/run_all.sh    # 一键运行全部五个阶段
 ```
+
+当前结果（全部通过）：
+
+| 阶段 | 内容 | 结果 |
+|---|---|---|
+| 1 | 加密模块安全测试（PBKDF2/HMAC/P2 往返/篡改检测/随机源/恒定时间比较） | **26/26 通过** |
+| 2 | 金额计算规则测试（解析/舍入/税率换算/多行合计/大写/10 万行无漂移） | **21/21 通过** |
+| 3 | 端到端测试（Playwright：8 视图、表单、二维码、下载、持久化、脏导入清理、金额规则） | **68/68 通过** |
+| 4 | 二维码闭环（生成 → PNG → OpenCV 解码 → SM4 解密 → 业务字段校验） | **5/5 通过** |
+| 5 | QR 编码器矩阵比对（Python `qrcode` 库，40 版本 × 4 等级 × 3 模式 + 随机） | **469 匹配 / 0 不符**（11 例双方均判超长） |
+
+单独运行某一阶段：`node test/crypto_test.js`、`node test/money_test.js`、`python3 test/e2e.py`、`python3 test/final_e2e.py`（后两者需 playwright；final_e2e 另需 opencv）。
+
+## 安全设计说明
+
+- **加密格式（P2）**：`P2.` + Base64( salt(16B) ‖ IV(16B) ‖ SM4-CBC(JSON) ‖ HMAC-SHA256(32B) )
+  - 密钥派生：`dk = PBKDF2(口令, salt, 100000, 32)`，`kEnc = dk[0:16]`、`kMac = dk[16:32]`（单次派生拆分为加密钥与 MAC 钥）
+  - 完整性：Encrypt-then-MAC，解密前以恒定时间比较校验 HMAC，防篡改与时序攻击
+  - 随机性：salt/IV 仅取自 `crypto.getRandomValues`，无弱随机回退
+- **口令边界**：仅存内存，不写入 localStorage、不进入导出备份；少于 8 位拒绝加密
+- **二维码有效期**：载荷内含 UTC 生成时间戳，基础信息 48 小时 / 交易信息 24 小时，页面实时倒计时展示
+- **数据边界**：全部数据仅存本机浏览器 localStorage（键名 `payinvoice_helper_v1`），不上传任何服务器；导入数据必须经白名单校验，非对象/非法 JSON/超 2MB 一律拒绝
+
+## 未解决问题（已知限制）
+
+1. **超大发票二维码容量**：QR 版本上限 40（177×177 模块，M 级），载荷超过容量时仅提示不支持，**未实现拆分多码**。常规发票（明细数十行内）不受影响。
+2. **有效期依赖扫码端**：过期时间戳由载荷携带，最终是否拒扫取决于扫码端（电子税务局/微信/支付宝）的校验实现，本工具只能保证时间戳正确写入。
+3. **localStorage 容量**：浏览器单源约 5MB 上限，超大批量明细（接近 200 条且字段很长）可能保存失败，目前仅做字符截断缓解，未做容量预检。
+4. **纯 JS 国密性能**：SM4 与 PBKDF2 均为纯 JS 实现，单次加解密约 530ms，可接受；若未来载荷显著增大需评估。
+
+## 部署步骤
+
+1. **获取代码**：`git clone https://github.com/alexandresilksail/TaxInvoiceSys.git`
+2. **构建交付物**：`python3 build.py` → 生成 `payinvoice开票助手.html`
+3. **分发**：将该 HTML 文件拷贝给使用人员，双击用 Chrome / Edge 打开即可；无需服务器、无需联网
+4. **运行测试**（开发侧）：`bash test/run_all.sh`（需 Node 22+、Python 3、playwright、opencv）
 
 ## 质量验证记录
 
 | 项目 | 方法 | 结果 |
 |---|---|---|
-| QR 编码器 | 与 Python `qrcode` 库矩阵级比对（40 版本 × 4 等级 × 3 模式 + 随机大文本） | 480+ 例 100% 一致 |
+| QR 编码器 | 与 Python `qrcode` 库矩阵级比对（40 版本 × 4 等级 × 3 模式 + 随机大文本） | 480 例：469 匹配 / 0 不符 / 11 双方均超长 |
 | 二维码可读性 | OpenCV 端到端解码生成的 PNG | 通过 |
-| PNG 导出保真 | SVG 矩阵 vs canvas PNG 矩阵逐模块比对 | 0/11025 差异 |
+| PNG 导出保真 | SVG 矩阵 vs canvas PNG 矩阵逐模块比对 | 0/11881 差异 |
 | SM4 加密 | 与 gmssl / OpenSSL 三方交叉验证 + 20 轮随机数据 | 20/20 一致 |
-| 应用端到端 | Playwright + Chromium（8 视图、表单、二维码、下载、持久化） | 41/41 通过 |
+| PBKDF2 | 与 Node 原生 `crypto.pbkdf2Sync` 6 组向量交叉验证（含跨块 dkLen） | 一致 |
+| 密文完整性 | HMAC 篡改、密文篡改、截断、P1 旧格式、错误口令 | 全部正确拒绝 |
+| 金额计算 | 整数分运算：10 万行合计零漂移、双重舍入边界（3×0.335→1.01） | 通过 |
+| 数据保护 | 口令不落盘/不进备份、9 项脏导入清理、防重复提交锁 | 通过（e2e 68 项覆盖） |
 
 ## 合规声明
 

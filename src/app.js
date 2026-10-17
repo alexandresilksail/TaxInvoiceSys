@@ -18,70 +18,15 @@ function escapeHtml(s) {
   });
 }
 
-function fmtMoney(n) {
-  if (!isFinite(n)) return '0.00';
-  return n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
-
 function fmtTime(ts) {
   var d = new Date(ts);
   function p(x) { return (x < 10 ? '0' : '') + x; }
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
 }
 
-/* 人民币大写（GB/T 约 15834 金额表示） */
-var RMB_DIGITS = ['零', '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖'];
-
-function rmbUpper(amount) {
-  if (typeof amount !== 'number' || !isFinite(amount) || amount < 0 || amount >= 1e16) return '';
-  if (Math.round(amount * 100) === 0) return '零元整';
-  var cents = Math.round(amount * 100);
-  var yuan = Math.floor(cents / 100), fen = cents % 100;
-  var jiao = Math.floor(fen / 10), centFen = fen % 10;
-  var intPart = '', fracPart = '';
-
-  if (yuan > 0) {
-    var s = String(yuan), groups = [];
-    // 每 4 位一组
-    while (s.length > 0) { groups.unshift(s.slice(-4)); s = s.slice(0, -4); }
-    var bigUnits = ['', '万', '亿', '万亿', '亿亿'];
-    var parts = [];
-    for (var g = 0; g < groups.length; g++) {
-      var grp = groups[g], unit = bigUnits[groups.length - 1 - g];
-      var gStr = '', zero = false, allZero = true;
-      for (var i = 0; i < grp.length; i++) {
-        var digit = +grp[i];
-        var pos = grp.length - 1 - i; // 0=个位
-        if (digit === 0) {
-          zero = true;
-        } else {
-          allZero = false;
-          if (zero && gStr !== '') gStr += '零';
-          zero = false;
-          gStr += RMB_DIGITS[digit] + ['', '拾', '佰', '仟'][pos];
-        }
-      }
-      if (!allZero) {
-        parts.push(gStr + unit);
-      } else if (parts.length > 0 && g < groups.length - 1) {
-        parts.push('零');
-      }
-    }
-    intPart = parts.join('');
-    // 清理连续零
-    intPart = intPart.replace(/零+/g, '零').replace(/零$/, '');
-    intPart += '元';
-  }
-
-  if (jiao === 0 && centFen === 0) {
-    fracPart = '整';
-  } else {
-    if (jiao > 0) fracPart += RMB_DIGITS[jiao] + '角';
-    if (centFen > 0) fracPart += RMB_DIGITS[centFen] + '分';
-  }
-  if (intPart === '' && fracPart !== '整') intPart = '';
-  return intPart + fracPart;
-}
+/* 金额展示/大写统一走 PayInvoiceMoney（整数"分"运算，见 money.js） */
+function fmtCents(c) { return PayInvoiceMoney.fmtCents(c); }
+function rmbUpperCents(c) { return PayInvoiceMoney.rmbUpperCents(c); }
 
 /* GB 32100-2015 统一社会信用代码校验位验证 */
 var USCC_CHARS = '0123456789ABCDEFGHJKLMNPQRTUWXY'; // 31 个字符（不含 I O Z S V）
@@ -143,10 +88,10 @@ function defaultState() {
     ],
     qr: {
       tab: 'basic',           // basic 基础信息 / txn 交易信息
-      password: '',
       basicGenAt: 0,          // 基础信息二维码生成时间戳
       txnGenAt: 0,            // 交易信息二维码生成时间戳
       printWidth: 5           // 计划打印宽度 cm
+      /* 注意：加密口令不存入 state（不落 localStorage、不进备份），仅存于内存 qrPassword */
     },
     progress: { prereq: {}, guide: {} },
     savedAt: 0
@@ -155,22 +100,92 @@ function defaultState() {
 
 function genId() { return 'it' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
+/* 二维码加密口令：仅存于当前页面内存，不写入 localStorage、不进入导出备份 */
+var qrPassword = '';
+
+/* ---------- 本地/导入数据白名单校验 ----------
+ * 任何进入 state 的数据（本地存储回读或备份导入）都必须经过 sanitizeState：
+ *  - 拒绝非对象/数组/超大结构的脏数据；
+ *  - 字段逐一类型校验、长度截断、条数限量，防 localStorage 超限与结构破坏；
+ *  - 剔除口令等不应持久化的字段。 */
+function sStr(v, max) {
+  if (typeof v === 'string') return v.slice(0, max);
+  if (typeof v === 'number' && isFinite(v)) return String(v).slice(0, max);
+  return '';
+}
+function sNum(v, min, max, dflt) {
+  var n = typeof v === 'number' ? v : parseFloat(v);
+  if (!isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+function sBoolMap(v) {
+  var out = {};
+  if (v && typeof v === 'object' && !Array.isArray(v)) {
+    Object.keys(v).forEach(function (k) {
+      if (k.length <= 64 && typeof v[k] === 'boolean') out[k] = v[k];
+    });
+  }
+  return out;
+}
+
+function sanitizeItem(it) {
+  if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
+  return {
+    id: sStr(it.id, 40) || genId(),
+    name: sStr(it.name, 200),
+    qty: sStr(it.qty, 30),
+    price: sStr(it.price, 30),
+    amount: sStr(it.amount, 30),
+    taxRate: sStr(it.taxRate, 10),
+    tax: sStr(it.tax, 30),
+    /* 自动带出标记：true 表示该值为公式计算结果，可被后续编辑刷新 */
+    _amtAuto: it._amtAuto === true,
+    _taxAuto: it._taxAuto === true
+  };
+}
+
+function sanitizeState(obj) {
+  var d = defaultState();
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('备份文件结构不正确（应为 JSON 对象）');
+  var qr = (obj.qr && typeof obj.qr === 'object' && !Array.isArray(obj.qr)) ? obj.qr : {};
+  var items = Array.isArray(obj.items) ? obj.items.slice(0, 200).map(sanitizeItem).filter(Boolean) : [];
+  if (items.length === 0) items = d.items;
+  return {
+    seller: {
+      name: sStr(obj.seller && obj.seller.name, 200),
+      taxNo: sStr(obj.seller && obj.seller.taxNo, 40),
+      addrTel: sStr(obj.seller && obj.seller.addrTel, 120),
+      bankAcc: sStr(obj.seller && obj.seller.bankAcc, 120)
+    },
+    buyer: {
+      name: sStr(obj.buyer && obj.buyer.name, 200),
+      taxNo: sStr(obj.buyer && obj.buyer.taxNo, 40),
+      addrTel: sStr(obj.buyer && obj.buyer.addrTel, 120),
+      bankAcc: sStr(obj.buyer && obj.buyer.bankAcc, 120),
+      email: sStr(obj.buyer && obj.buyer.email, 100)
+    },
+    invoiceType: obj.invoiceType === 'normal' ? 'normal' : 'special',
+    invoiceForm: ['digital', 'electronic', 'paper'].indexOf(obj.invoiceForm) >= 0 ? obj.invoiceForm : 'digital',
+    remark: sStr(obj.remark, 500),
+    items: items,
+    qr: {
+      tab: qr.tab === 'txn' ? 'txn' : 'basic',
+      basicGenAt: sNum(qr.basicGenAt, 0, 8.64e15, 0),
+      txnGenAt: sNum(qr.txnGenAt, 0, 8.64e15, 0),
+      printWidth: sNum(qr.printWidth, 1.8, 30, 5)   /* 打印宽度限制 1.8~30 cm */
+    },
+    progress: { prereq: sBoolMap(obj.progress && obj.progress.prereq), guide: sBoolMap(obj.progress && obj.progress.guide) },
+    savedAt: sNum(obj.savedAt, 0, 8.64e15, 0)
+  };
+}
+
 var state = loadState();
 
 function loadState() {
   try {
     var raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return defaultState();
-    var s = JSON.parse(raw);
-    var d = defaultState();
-    // 浅合并，保证新字段有默认值
-    var merged = Object.assign(d, s);
-    merged.seller = Object.assign(d.seller, s.seller || {});
-    merged.buyer = Object.assign(d.buyer, s.buyer || {});
-    merged.qr = Object.assign(d.qr, s.qr || {});
-    merged.progress = Object.assign(d.progress, s.progress || {});
-    if (!Array.isArray(merged.items) || merged.items.length === 0) merged.items = d.items;
-    return merged;
+    return sanitizeState(JSON.parse(raw));
   } catch (e) {
     return defaultState();
   }
@@ -306,9 +321,9 @@ function renderWorkbench() {
         + '<input data-f="name" value="' + escapeHtml(it.name) + '" placeholder="如：*信息技术服务*软件开发">'
         + '<input data-f="qty" type="number" min="0" step="any" value="' + escapeHtml(it.qty) + '" placeholder="0">'
         + '<input data-f="price" type="number" min="0" step="any" value="' + escapeHtml(it.price) + '" placeholder="0.00">'
-        + '<input data-f="amount" type="number" min="0" step="any" value="' + escapeHtml(line.amount) + '" placeholder="0.00">'
+        + '<input data-f="amount" type="number" min="0" step="any" value="' + escapeHtml(it.amount !== '' && it.amount != null ? it.amount : line.amtStr) + '" placeholder="0.00">'
         + '<select data-f="taxRate">' + TAX_RATES.map(function (r) { return '<option' + (it.taxRate === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') + '</select>'
-        + '<input data-f="tax" value="' + (line.tax !== '' ? line.tax : '') + '" placeholder="自动" title="留空则按金额×税率自动计算">'
+        + '<input data-f="tax" value="' + escapeHtml(it.tax !== '' && it.tax != null ? it.tax : line.taxStr) + '" placeholder="自动" title="留空则按金额×税率自动计算；填 0 表示零税额">'
         + '<button class="del" data-act="del-item" title="删除本行">✕</button>'
         + '</div>';
     }).join('')
@@ -324,10 +339,10 @@ function renderWorkbench() {
     + renderInvoicePreview(totals)
     + '</div>'
     + '<div class="card"><div class="card-title">合计与校验</div>'
-    + '<div class="kv"><span class="k">不含税金额合计</span><span class="v">¥ ' + fmtMoney(totals.amount) + '</span></div>'
-    + '<div class="kv"><span class="k">税额合计</span><span class="v">¥ ' + fmtMoney(totals.tax) + '</span></div>'
-    + '<div class="kv"><span class="k">价税合计（大写）</span><span class="v" style="font-size:12px">' + (rmbUpper(totals.total) || '—') + '</span></div>'
-    + '<div class="kv"><span class="k">价税合计（小写）</span><span class="v" style="color:var(--red);font-size:16px">¥ ' + fmtMoney(totals.total) + '</span></div>'
+    + '<div class="kv" data-kv="amount"><span class="k">不含税金额合计</span><span class="v">¥ ' + fmtCents(totals.amountCents) + '</span></div>'
+    + '<div class="kv" data-kv="tax"><span class="k">税额合计</span><span class="v">¥ ' + fmtCents(totals.taxCents) + '</span></div>'
+    + '<div class="kv" data-kv="upper"><span class="k">价税合计（大写）</span><span class="v" style="font-size:12px">' + (rmbUpperCents(totals.totalCents) || '—') + '</span></div>'
+    + '<div class="kv" data-kv="total"><span class="k">价税合计（小写）</span><span class="v" style="color:var(--red);font-size:16px">¥ ' + fmtCents(totals.totalCents) + '</span></div>'
     + '<div class="btn-row">'
     + '<button class="btn btn-primary" data-act="goto-qr">📱 生成便捷开票二维码</button>'
     + '<button class="btn btn-navy" data-act="open-etax">🌐 打开电子税务局</button>'
@@ -356,33 +371,60 @@ function alertHtml(type, ico, text) {
   return '<div class="alert alert-' + type + '"><span>' + ico + '</span><span>' + escapeHtml(text) + '</span></div>';
 }
 
+/* 行计算（金额单位：分）：
+ * 金额 = 用户手填金额优先（_amtAuto 标记的自动值除外）；
+ *        为空或非法时回落到 数量×单价 自动值。
+ * 税额 = 用户手填税额优先（含 "0"，表示零税额/免税，_taxAuto 标记除外）；
+ *        未手填时按行金额 × 税率四舍五入到分。 */
 function lineCalc(it) {
-  var qty = parseFloat(it.qty), price = parseFloat(it.price);
-  var amount = '';
-  if (isFinite(qty) && isFinite(price) && qty > 0 && price > 0) {
-    amount = (qty * price).toFixed(2);
+  var auto = PayInvoiceMoney.mulQtyPrice(it.qty, it.price);
+  var amt = null;
+  if (it.amount !== '' && it.amount != null) {
+    amt = PayInvoiceMoney.toCents(it.amount);
+    if (amt == null) amt = auto; /* 手填非法时回落到自动值，自检会提示 */
+  } else {
+    amt = auto;
   }
-  var amt = parseFloat(it.amount !== '' && it.amount != null ? it.amount : amount);
-  var rate = parseFloat(String(it.taxRate).replace('%', '')) / 100;
-  var tax = '';
-  if (isFinite(amt) && amt > 0 && isFinite(rate)) tax = (amt * rate).toFixed(2);
-  return { amount: amount, tax: tax };
+  /* 自动带出的金额：随 数量×单价 重新计算；无法计算时保留原值（与输入框显示保持一致） */
+  if (it._amtAuto && auto != null) amt = auto;
+  var tax = null;
+  if (it.tax !== '' && it.tax != null && !it._taxAuto) {
+    tax = PayInvoiceMoney.toCents(it.tax); /* "0" → 0，零税额 */
+  }
+  if (tax == null) {
+    var bp = PayInvoiceMoney.rateToBp(it.taxRate);
+    if (amt != null && bp != null) tax = PayInvoiceMoney.taxOfCents(amt, bp);
+  }
+  return {
+    amt: amt,                                  /* 分；null = 无效 */
+    tax: tax,                                  /* 分；null = 无效 */
+    amtStr: amt == null ? '' : PayInvoiceMoney.centsToStr(amt),
+    taxStr: tax == null ? '' : PayInvoiceMoney.centsToStr(tax),
+    amountValid: it.amount === '' || it.amount == null || PayInvoiceMoney.toCents(it.amount) != null,
+    taxValid: it.tax === '' || it.tax == null || PayInvoiceMoney.toCents(it.tax) != null
+  };
 }
 
+/* 合计（全部为整数分运算，无浮点累加误差）；
+ * 有效行 = 手填/自动金额可解析且 > 0 的明细行 */
 function calcTotals() {
-  var amount = 0, tax = 0;
+  var amountCents = 0, taxCents = 0, validLines = 0, allValid = true;
   state.items.forEach(function (it) {
     var line = lineCalc(it);
-    var amt = parseFloat(it.amount);
-    var taxManual = parseFloat(it.tax);
-    if (isFinite(amt) && amt > 0) amount += amt;
-    if (isFinite(taxManual) && taxManual > 0) tax += taxManual;
-    else if (isFinite(amt) && amt > 0) {
-      var rate = parseFloat(String(it.taxRate).replace('%', '')) / 100;
-      if (isFinite(rate)) tax += amt * rate;
+    if (!line.amountValid || !line.taxValid) allValid = false;
+    if (line.amt != null && line.amt > 0) {
+      amountCents += line.amt;
+      validLines++;
     }
+    if (line.tax != null && line.tax > 0) taxCents += line.tax;
   });
-  return { amount: amount, tax: tax, total: amount + tax };
+  return {
+    amountCents: amountCents,
+    taxCents: taxCents,
+    totalCents: amountCents + taxCents,
+    validLines: validLines,
+    allValid: allValid
+  };
 }
 
 function ph(v, label) {
@@ -408,8 +450,8 @@ function renderInvoicePreview(t) {
     + (state.items.length === 0 ? '<tr><td colspan="6" class="empty">暂无明细行</td></tr>' : '')
     + state.items.map(function (it) {
       var line = lineCalc(it);
-      var amt = it.amount !== '' && it.amount != null ? it.amount : line.amount;
-      var tax = it.tax !== '' && it.tax != null ? it.tax : line.tax;
+      var amt = line.amtStr;   /* 规范化到分的展示值 */
+      var tax = line.taxStr;
       return '<tr><td>' + (it.name ? escapeHtml(it.name) : '<span style="color:var(--ink-3)">（未填写）</span>') + '</td>'
         + '<td class="num">' + escapeHtml(it.qty || '—') + '</td>'
         + '<td class="num">' + (it.price ? escapeHtml(it.price) : '—') + '</td>'
@@ -418,8 +460,8 @@ function renderInvoicePreview(t) {
         + '<td class="num">' + (tax ? escapeHtml(tax) : '—') + '</td></tr>';
     }).join('')
     + '</tbody></table></div>'
-    + '<div class="inv-total"><span class="cap">价税合计（大写）：' + (rmbUpper(t.total) || '—') + '</span>'
-    + '<span>小写：<span class="amt">¥ ' + fmtMoney(t.total) + '</span></span></div>'
+    + '<div class="inv-total"><span class="cap">价税合计（大写）：' + (rmbUpperCents(t.totalCents) || '—') + '</span>'
+    + '<span>小写：<span class="amt">¥ ' + fmtCents(t.totalCents) + '</span></span></div>'
     + (state.remark ? '<div style="margin-top:6px;font-size:11.5px;color:var(--ink-2)">备注：' + escapeHtml(state.remark) + '</div>' : '')
     + '</div>';
 }
@@ -435,8 +477,11 @@ function renderSelfCheck(t) {
     checks.push([!!b.addrTel.trim(), '专票地址电话已填写']);
     checks.push([!!b.bankAcc.trim(), '专票开户行及账号已填写']);
   }
-  checks.push([state.items.some(function (it) { return it.name && (it.amount || (it.qty && it.price)); }), '至少一行有效交易明细']);
-  checks.push([t.total > 0, '价税合计大于 0']);
+  checks.push([state.items.some(function (it) {
+    return it.name && it.name.trim() && (function () { var l = lineCalc(it); return l.amt != null && l.amt > 0; })();
+  }), '至少一行有效交易明细（名称 + 金额）']);
+  checks.push([t.totalCents > 0, '价税合计大于 0']);
+  checks.push([t.allValid, '明细金额/税额均为有效数字（非负、小数不超限）']);
   var taxNoCheck = validateTaxNo(b.taxNo);
   checks.push([!b.taxNo.trim() || taxNoCheck.ok, '购买方税号校验（' + (b.taxNo.trim() ? (taxNoCheck.ok ? '通过' : '未通过') : '待填写') + '）']);
   var okCount = checks.filter(function (c) { return c[0]; }).length;
@@ -491,12 +536,25 @@ function bindWorkbench() {
         if (!it) return;
         var f = inp.getAttribute('data-f');
         it[f] = inp.value;
-        if (f === 'qty' || f === 'price') {
-          var line = lineCalc(it);
-          if (it.amount === '' || it.amount == null || !isFinite(parseFloat(it.amount))) {
-            it.amount = line.amount;
-            $('input[data-f="amount"]', row).value = line.amount;
-          }
+        /* 用户在金额/税额列直接输入 → 标记为手填（此后不被自动计算覆盖）；
+           自动带出的值带 _amtAuto/_taxAuto 标记，可被后续数量/单价/税率变更刷新 */
+        if (f === 'amount') it._amtAuto = false;
+        if (f === 'tax') it._taxAuto = false;
+        var line = lineCalc(it);
+        /* 金额列为空/非法/自动值时，用 数量×单价 的规范化结果带出 */
+        if (f !== 'amount' && (it._amtAuto || PayInvoiceMoney.toCents(it.amount) == null) && line.amtStr !== '') {
+          it.amount = line.amtStr;
+          it._amtAuto = true;
+          var amtInput = $('input[data-f="amount"]', row);
+          if (amtInput) amtInput.value = line.amtStr;
+        }
+        /* 税额列为空/非法/自动值时，按 金额×税率 带出；金额手改时自动税额跟随刷新 */
+        var taxFollow = (f === 'amount' && it._taxAuto) || (f !== 'tax' && (it._taxAuto || PayInvoiceMoney.toCents(it.tax) == null));
+        if (taxFollow && line.taxStr !== '') {
+          it.tax = line.taxStr;
+          it._taxAuto = true;
+          var taxInput = $('input[data-f="tax"]', row);
+          if (taxInput) taxInput.value = line.taxStr;
         }
         saveState(); refreshWorkbenchPreview();
       });
@@ -537,13 +595,13 @@ function refreshWorkbenchPreview() {
   if (checkCard) {
     checkCard.innerHTML = '<div class="card-title">开票前自检</div>' + renderSelfCheck(t);
   }
-  var kv = $$('.card .kv');
-  if (kv.length >= 4) {
-    kv[0].querySelector('.v').textContent = '¥ ' + fmtMoney(t.amount);
-    kv[1].querySelector('.v').textContent = '¥ ' + fmtMoney(t.tax);
-    kv[2].querySelector('.v').textContent = rmbUpper(t.total) || '—';
-    kv[3].querySelector('.v').textContent = '¥ ' + fmtMoney(t.total);
-  }
+  /* 合计区用 data-kv 定位，避免依赖 DOM 顺序 */
+  var kv = {};
+  $$('.kv[data-kv]').forEach(function (el) { kv[el.getAttribute('data-kv')] = el.querySelector('.v'); });
+  if (kv.amount) kv.amount.textContent = '¥ ' + fmtCents(t.amountCents);
+  if (kv.tax) kv.tax.textContent = '¥ ' + fmtCents(t.taxCents);
+  if (kv.upper) kv.upper.textContent = rmbUpperCents(t.totalCents) || '—';
+  if (kv.total) kv.total.textContent = '¥ ' + fmtCents(t.totalCents);
 }
 
 /* ============================================================
@@ -567,35 +625,38 @@ function qrPayload(type) {
     type: 'txn', ver: 1,
     seller: { name: s.name, taxNo: s.taxNo },
     buyer: { name: b.name, taxNo: b.taxNo },
-    items: state.items.filter(function (it) { return it.name; }).map(function (it) {
+    items: state.items.filter(function (it) { return it.name && it.name.trim(); }).map(function (it) {
       var line = lineCalc(it);
       return {
         name: it.name, qty: it.qty, price: it.price,
-        amount: it.amount !== '' && it.amount != null ? it.amount : line.amount,
+        amount: line.amtStr,
         taxRate: it.taxRate,
-        tax: it.tax !== '' && it.tax != null ? it.tax : line.tax
+        tax: line.taxStr
       };
-    }),
-    total: { amount: round2(t.amount), tax: round2(t.tax), total: round2(t.total) },
+    }).filter(function (row) { return row.amount !== ''; }),
+    total: {
+      amount: PayInvoiceMoney.centsToStr(t.amountCents),
+      tax: PayInvoiceMoney.centsToStr(t.taxCents),
+      total: PayInvoiceMoney.centsToStr(t.totalCents)
+    },
     ts: state.qr.txnGenAt
   };
 }
-
-function round2(n) { return Math.round(n * 100) / 100; }
 
 function renderQR() {
   var tab = state.qr.tab;
   var payload = qrPayload(tab);
   var genAt = tab === 'basic' ? state.qr.basicGenAt : state.qr.txnGenAt;
-  var password = state.qr.password || 'payinvoice';
+  var password = qrPassword;            /* 仅内存，不持久化 */
+  var pwdOk = password.length >= 8;
   var hasData = tab === 'basic'
     ? (state.buyer.name.trim() && state.buyer.taxNo.trim())
     : (state.seller.name.trim() && state.seller.taxNo.trim() && payload.items.length > 0);
 
-  var svgHtml = '', meta = '';
-  if (hasData) {
+  var svgHtml = '', meta = '', encrypted = null;
+  if (hasData && pwdOk) {
     try {
-      var encrypted = PayInvoiceCrypto.encryptPayload(payload, password);
+      encrypted = PayInvoiceCrypto.encryptPayload(payload, password);
       var r = PayInvoiceQR.toSVG(encrypted, { ecLevel: 'M', quiet: 4, scale: 8 });
       svgHtml = r.svg;
       var n = r.moduleCount;
@@ -610,6 +671,8 @@ function renderQR() {
     } catch (e) {
       svgHtml = '<div class="alert alert-err"><span>⚠️</span><span>生成失败：' + escapeHtml(e.message) + '。请缩短内容或检查输入。</span></div>';
     }
+  } else if (hasData) {
+    svgHtml = '<div class="alert alert-warn"><span>⚠️</span><span>请先输入至少 8 位加密口令（字母、数字组合）再生成二维码。口令仅保存在当前页面内存中：不写入本地存储、不进入导出备份，刷新页面后需重新输入。</span></div>';
   }
 
   var remaining = genAt ? (genAt + QR_COUNTDOWN[tab] - Date.now()) : -1;
@@ -637,19 +700,19 @@ function renderQR() {
     + '</div>'
     + '<div class="btn-row" style="margin-top:12px">'
     + '<button class="btn btn-primary" data-act="qr-gen" ' + (hasData ? '' : 'disabled') + '>🔄 ' + (genAt ? '重新生成' : '生成二维码') + '</button>'
-    + '<button class="btn btn-navy" data-act="qr-png" ' + (hasData && !expired ? '' : 'disabled') + '>💾 下载 PNG</button>'
-    + '<button class="btn btn-ghost" data-act="qr-print" ' + (hasData && !expired ? '' : 'disabled') + '>🖨️ 打印</button>'
+    + '<button class="btn btn-navy" data-act="qr-png" ' + (hasData && !expired && encrypted ? '' : 'disabled') + '>💾 下载 PNG</button>'
+    + '<button class="btn btn-ghost" data-act="qr-print" ' + (hasData && !expired && encrypted ? '' : 'disabled') + '>🖨️ 打印</button>'
     + '</div>'
     + '</div>'
     /* ---- 右：加密载荷 + 规范面板 ---- */
     + '<div>'
     + '<div class="card"><div class="card-title">国密加密载荷（SM4-CBC）</div>'
     + '<div class="form-row">'
-    + '<div class="field"><label>加密口令</label><input id="qrPwd" value="' + escapeHtml(state.qr.password) + '" placeholder="默认 payinvoice"><div class="hint">口令经 SHA-256 派生 128 位密钥；载荷 = IV(16B) + SM4-CBC(JSON)</div></div>'
-    + '<div class="field"><label>计划打印宽度（cm）</label><input id="qrWidth" type="number" min="1.8" step="0.1" value="' + state.qr.printWidth + '"><div class="hint">用于核算每模块物理尺寸是否满足 ≥1.8cm</div></div>'
+    + '<div class="field"><label>加密口令</label><input id="qrPwd" type="password" autocomplete="off" value="' + escapeHtml(qrPassword) + '" placeholder="至少 8 位（字母数字组合）"><div class="hint">口令经 PBKDF2-HMAC-SHA256（10 万次迭代）派生加密与校验密钥；载荷 = salt + IV + SM4 密文 + HMAC（P2 格式）。仅存于当前页面内存，不写入本地存储、不进入导出备份。</div></div>'
+    + '<div class="field"><label>计划打印宽度（cm）</label><input id="qrWidth" type="number" min="1.8" max="30" step="0.1" value="' + state.qr.printWidth + '"><div class="hint">用于核算每模块物理尺寸是否满足 ≥1.8cm（允许 1.8~30）</div></div>'
     + '</div>'
-    + (hasData ? '<div class="payload-box" id="qrPayloadBox">' + escapeHtml(encrypted || '') + '<button class="btn btn-sm btn-light copy-btn" data-act="qr-copy">复制</button></div>'
-      : '<div class="empty">填写开票信息后自动生成加密载荷</div>')
+    + (encrypted ? '<div class="payload-box" id="qrPayloadBox">' + escapeHtml(encrypted) + '<button class="btn btn-sm btn-light copy-btn" data-act="qr-copy">复制</button></div>'
+      : '<div class="empty">' + (hasData ? '输入加密口令后自动生成加密载荷' : '填写开票信息后自动生成加密载荷') + '</div>')
     + '</div>'
     + '<div class="card"><div class="card-title">规范合规面板</div>'
     + '<ul class="spec-list">'
@@ -659,7 +722,7 @@ function renderQR() {
     + specRow('物理尺寸', meta ? state.qr.printWidth.toFixed(1) + ' cm（每模块 ' + meta.perModuleCm.toFixed(3) + ' cm）' : '≥ 1.8 cm × 1.8 cm', meta ? meta.sizeOk : true)
     + specRow('模块总数', meta ? meta.n + ' × ' + meta.n : '—', true)
     + specRow('二维码版本', meta ? 'Version ' + meta.version : '—', true)
-    + specRow('加密算法', 'SM4-CBC（GM/T 0002-2012）+ SHA-256', true)
+    + specRow('加密算法', 'SM4-CBC（GM/T 0002-2012）+ PBKDF2 / HMAC-SHA256', true)
     + specRow('载荷长度', meta ? meta.payloadLen + ' 字符' : '—', true)
     + '</ul>'
     + (meta && !meta.sizeOk ? '<div class="alert alert-warn" style="margin-top:10px"><span>⚠️</span><span>计划打印宽度 ' + state.qr.printWidth.toFixed(1) + ' cm 小于规范要求的 1.8 cm，请增大打印宽度。</span></div>' : '')
@@ -693,14 +756,29 @@ function bindQR() {
     saveState(); renderShell();
   });
   var pwd = document.getElementById('qrPwd');
-  if (pwd) pwd.addEventListener('input', function () { state.qr.password = pwd.value; saveState(); });
+  if (pwd) {
+    pwd.addEventListener('input', function () {
+      qrPassword = pwd.value;   /* 仅内存，不调用 saveState（口令不落盘） */
+    });
+    pwd.addEventListener('change', function () {
+      renderShell();            /* 失焦后用新口令重新生成二维码 */
+    });
+  }
   var w = document.getElementById('qrWidth');
   if (w) w.addEventListener('input', function () {
-    state.qr.printWidth = parseFloat(w.value) || 5;
+    var nw = parseFloat(w.value);
+    state.qr.printWidth = isFinite(nw) ? Math.min(30, Math.max(1.8, nw)) : 5;
     saveState();
   });
+  if (w) w.addEventListener('change', function () { renderShell(); });
 
   bindAction('qr-gen', function () {
+    if (qrPassword.length < 8) {
+      toast('请先输入至少 8 位加密口令再生成二维码', 'err');
+      var pwdEl = document.getElementById('qrPwd');
+      if (pwdEl) pwdEl.focus();
+      return;
+    }
     if (state.qr.tab === 'basic') state.qr.basicGenAt = Date.now();
     else state.qr.txnGenAt = Date.now();
     saveState(); renderShell();
@@ -1087,6 +1165,9 @@ function renderComply() {
  * 十一、数据管理
  * ============================================================ */
 
+/* 数据管理操作防重复提交：按操作类型分别加锁，互不阻塞 */
+var dataBusy = { exporting: false, importing: false };
+
 function renderData() {
   var raw = '';
   try { raw = localStorage.getItem(STORAGE_KEY) || ''; } catch (e) {}
@@ -1108,23 +1189,31 @@ function renderData() {
     + '<button class="btn btn-light" data-act="data-demo">📦 载入示例数据</button>'
     + '</div>'
     + '<input type="file" id="importFile" accept=".json,application/json" style="display:none">'
-    + '<div class="hint" style="margin-top:10px">导出的 JSON 包含开票信息、明细、二维码时间戳与进度，不含加密口令；导入将覆盖当前全部本地数据。</div>'
+    + '<div class="hint" style="margin-top:10px">导出的 JSON 包含开票信息、明细、二维码时间戳与进度，<b>不含加密口令</b>（口令仅存于当前页面内存）；导入将覆盖当前全部本地数据（文件须 ≤2 MB，内容经结构白名单校验，非法字段自动清理）。</div>'
     + '</div>';
 }
 
 function bindData() {
   bindAction('data-export', function () {
-    state.savedAt = Date.now();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    var blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
-    var a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'payinvoice_backup_' + new Date().toISOString().slice(0, 10) + '.json';
-    a.click();
-    setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
-    toast('备份已导出', 'ok');
+    if (dataBusy.exporting) return;            /* 防重复提交 */
+    dataBusy.exporting = true;
+    try {
+      state.savedAt = Date.now();
+      /* state 中不含加密口令（口令仅存内存），导出内容天然不含口令 */
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      var blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'payinvoice_backup_' + new Date().toISOString().slice(0, 10) + '.json';
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+      toast('备份已导出（不含加密口令）', 'ok');
+    } finally {
+      setTimeout(function () { dataBusy.exporting = false; }, 800);
+    }
   });
   bindAction('data-import', function () {
+    if (dataBusy.importing) return;
     $('#importFile').click();
   });
   bindAction('data-clear', function () {
@@ -1144,21 +1233,35 @@ function bindData() {
   if (file) file.addEventListener('change', function () {
     var f = file.files && file.files[0];
     if (!f) return;
+    if (f.size > 2 * 1024 * 1024) {           /* 备份上限 2MB，防 localStorage 写爆 */
+      toast('导入失败：文件超过 2 MB 上限', 'err');
+      file.value = '';
+      return;
+    }
+    if (dataBusy.importing) { file.value = ''; return; } /* 防重复提交 */
+    dataBusy.importing = true;
     var reader = new FileReader();
     reader.onload = function () {
       try {
         var obj = JSON.parse(reader.result);
-        if (!obj || typeof obj !== 'object') throw new Error('文件格式不正确');
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
-        state = loadState();
+        var clean = sanitizeState(obj);        /* 白名单校验，失败抛错 */
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(clean));
+        state = clean;
         renderShell();
-        toast('备份导入成功', 'ok');
+        toast('备份导入成功（已按结构校验清理）', 'ok');
       } catch (e) {
         toast('导入失败：' + e.message, 'err');
+      } finally {
+        dataBusy.importing = false;
+        file.value = '';
       }
     };
+    reader.onerror = function () {
+      dataBusy.importing = false;
+      toast('导入失败：文件读取错误', 'err');
+      file.value = '';
+    };
     reader.readAsText(f);
-    file.value = '';
   });
 }
 

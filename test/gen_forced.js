@@ -1,6 +1,6 @@
 /* 调试：对每个失败用例，遍历 8 个掩码，判断是否存在与 Python 一致的矩阵 */
-require('/root/.codebuddy/artifact/payinvoice/src/qr_tables.js');
-require('/root/.codebuddy/artifact/payinvoice/src/qrcode.js');
+require('/workspace/src/qr_tables.js');
+require('/workspace/src/qrcode.js');
 const QR = globalThis.PayInvoiceQR;
 const fs = require('fs');
 
@@ -9,8 +9,8 @@ const cases = [
   ['alnum', 'HELLO WORLD 123 ABC'],
   ['byte', 'PAYINVOICE 开票助手 SM4 TEST'],
 ];
-const js = JSON.parse(fs.readFileSync('/root/.codebuddy/artifact/payinvoice/test/js_matrices.json', 'utf8'));
-fs.writeFileSync('/root/.codebuddy/artifact/payinvoice/test/js_matrices_allmasks.json', JSON.stringify(
+const js = JSON.parse(fs.readFileSync('/workspace/test/js_matrices.json', 'utf8'));
+fs.writeFileSync('/workspace/test/js_matrices_allmasks.json', JSON.stringify(
   Object.fromEntries(Object.entries(js).filter(([k, v]) => !v.error).map(([k, v]) => [k, v.modules]))
 ));
 
@@ -32,5 +32,5 @@ for (const ec of ['L', 'M', 'Q', 'H']) {
     }
   }
 }
-fs.writeFileSync('/root/.codebuddy/artifact/payinvoice/test/js_matrices_forced.json', JSON.stringify(allMaskOut));
+fs.writeFileSync('/workspace/test/js_matrices_forced.json', JSON.stringify(allMaskOut));
 console.log('forced-mask cases:', Object.keys(allMaskOut).length);

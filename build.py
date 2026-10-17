@@ -18,10 +18,11 @@ css = read('style.css')
 qr_tables = read('qr_tables.js')
 qrcode = read('qrcode.js')
 crypto = read('crypto.js')
+money = read('money.js')
 app = read('app.js')
 
 # JS 内嵌进 <script> 时需避免出现 "</script>" 字样
-for name, js in [('qr_tables.js', qr_tables), ('qrcode.js', qrcode), ('crypto.js', crypto), ('app.js', app)]:
+for name, js in [('qr_tables.js', qr_tables), ('qrcode.js', qrcode), ('crypto.js', crypto), ('money.js', money), ('app.js', app)]:
     if '</script>' in js.lower():
         raise SystemExit(f'{name} 含有 </script>，需先转义')
 
@@ -78,6 +79,9 @@ __QRCODE__
 __CRYPTO__
 </script>
 <script>
+__MONEY__
+</script>
+<script>
 __APP__
 </script>
 </body>
@@ -89,6 +93,7 @@ html = (html
         .replace('__QR_TABLES__', qr_tables)
         .replace('__QRCODE__', qrcode)
         .replace('__CRYPTO__', crypto)
+        .replace('__MONEY__', money)
         .replace('__APP__', app))
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)

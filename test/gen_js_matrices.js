@@ -1,6 +1,6 @@
 /* 测试：输出全部版本×纠错等级的矩阵，与 Python qrcode 参考实现比对 */
-require('/root/.codebuddy/artifact/payinvoice/src/qr_tables.js');
-require('/root/.codebuddy/artifact/payinvoice/src/qrcode.js');
+require('/workspace/src/qr_tables.js');
+require('/workspace/src/qrcode.js');
 const QR = globalThis.PayInvoiceQR;
 
 const fs = require('fs');
@@ -31,7 +31,7 @@ for (const ec of ['L', 'M', 'Q', 'H']) {
   }
 }
 
-fs.writeFileSync('/root/.codebuddy/artifact/payinvoice/test/js_matrices.json', JSON.stringify(out));
+fs.writeFileSync('/workspace/test/js_matrices.json', JSON.stringify(out));
 console.log('cases:', Object.keys(out).length);
 
 // GF 与 RS 单点自检
